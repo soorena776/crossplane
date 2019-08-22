@@ -1,3 +1,4 @@
+
 # Resource Connectivity
 
 * Owner: Nic Cope (@negz)
@@ -7,7 +8,7 @@
 ## Terminology
 
 * _External resource_. An actual resource that exists outside Kubernetes,
-  typically in the cloud. AWS RDS and GCP Cloud Memorystore instaces are
+  typically in the cloud. AWS RDS and GCP Cloud Memorystore instances are
   external resources.
 * _Managed resource_. The Crossplane representation of an external resource.
   The `RDSInstance` and `CloudMemorystoreInstance` Kubernetes kinds are managed
@@ -364,7 +365,7 @@ a `MySQLInstance` can be configured roughly as follows:
    ensure any managed resources backing the aforementioned claims can connect,
    for example ensuring they're both configured to use the aforementioned VPC
    network.
-1. The app operator creates their `KubernetesCluster` and `MySQLInstance`
+1. The app operator creates their `KubernetesCluster` and `MySQLInstance` 
    resource claims, which either explicitly reference or default to the resource
    classes created in step 2. Because their underlying managed resources are
    appropriately configured, they can now communicate!
@@ -389,7 +390,7 @@ API conventions] state:
 
 Crossplane currently uses these conventions to create references between
 resource claims and classes, resource claims and managed resources, etc. No
-pattern currently exists for modelling relationships between managed resources.
+pattern currently exists for modeling relationships between managed resources.
 
 Assume a `Network` managed resource named `kubernetesname` exists in namespace
 `crossplane-system`. Further assume this managed resource represents a GCP VPC
@@ -410,10 +411,9 @@ could be implemented in one of two ways:
    order to determine that it is named `externalname` when submitting requests
    to the GCP API.
 
-This document suggests the first approach, both because it requires less logic
-and fewer Kubernetes API calls to implement, and because it enables Crossplane
+This document uses a combination of these approaches. For GCP case approach one is used both because it requires less logic and fewer Kubernetes API calls to implement, and because it enables Crossplane
 users to reference both external resources that are and are not modelled as
-Crossplane managed resources.
+Crossplane managed resources. For AWS case, a combination of both approaches are used.
 
 ### Google Cloud Platform
 
@@ -442,7 +442,7 @@ that is created automatically at GCP project creation time. i.e.:
 * Use the `GKECluster` managed resource's existing support for setting the
   [GKE cluster external resource]'s `.ipAllocationPolicy.useIpAliases` and
   `.ipAllocationPolicy.createSubnetwork` fields.
-* Leverage the [GKE cluster external resource]'s default behaviour of using the
+* Leverage the [GKE cluster external resource]'s default behavior of using the
   project's `default` VPC network if none is specified.
 * Add support for `CloudSQLInstance` managed resources and their resource claims
   to specify the external resource's `.ipConfiguration.privateNetwork`, and
@@ -638,7 +638,279 @@ parameters:
 
 ### Amazon Web Services
 
-TBD.
+In Amazon Web Services (AWS), `KubernetesCluster` and `MySQLInstance` claims are satisfied by `EKSCluster` and `RDSInstace` resource classes. 
+Similar to GCP, one network and one or more sub-networks are needed to connect `EKSCluster` and `RDSInstance` instances:
+
+* `AwsVpc`: creates a virtual private cloud (VPC) in AWS.
+* `AwsSubnet`: creates a virtual subnetwork within a `AwsVpc`
+
+However, unlike `GKECluster`, setting up an `EKSCluster` is less straightforward and requires more configurations. This is mostly because the worker nodes are not directly managed by the EKS cluster. Instead regular EC2 instances are launched and configured to communicate with the cluster. While creating new instances can be done at the time of cluster creation, a few network and security related resources need to be created previously:
+
+* `AwsSecurityGroup`: allows the cluster to communicate with worker nodes. It logically groups the resources that could communicate with each other within a VPC, and also adds ingress and egress traffic rules.
+* `AwsIamRole`: enables EKS to make calls to other AWS services to manage the resources.
+* `AwsIamRolePolicyAttachment`: attaches required policies the EKS role.
+* `AwsInternetGateway`: enables the nodes to have traffic to and from the internet. This is necessary because most workloads have a UI that needs to be accessed from the internet.
+* `AwsRouteTable`: for routing internet traffic from `AwsSubnet`s to `AwsInternetGateway`.
+* `AwsRoutTableAssociation`: associates an `AwsRouteTable` to a `AwsSubnet`.
+
+In addition, `RDSInstance`s also need following resources, so that they are accessible by the the worker nodes:
+
+* `AwsDbSubnetGroup`: represents a group of `AwsSubnet`s from different availability zones, from which a private IP is chosen and assigned to the RDS instance. 
+* `AwsSecurityGroup`: allows the RDS instance to accept traffic from a certain IP and port.
+
+To achieve resource connectivity goal in AWS, two approaches can be imagined:
+
+1. **Single managed resource for a given configuration:** Encapsulate all the external resource types in a general `AwsNetwork` type and create a single managed resource which implements a certain configuration.
+2. **Multiple managed resources**: Create a corresponding managed resource for each required external resource, and manage their connectivity by cross-object references.
+
+Although the first approach requires potentially less effort, the latter approach provides a few advantages:
+
+1. **Reusability**: the new managed resource types could be later re-used for other configurations
+1. **YAML Configuration**: instead of implementing a specific configuration logic inside `AwsNetwork`, the configuration details are expressed in a YAML file. This makes creating more sophisticated configurations possible, without having to write controllers. 
+
+This document focuses on implementing the second approach. For doing so, we address the following challenges:
+
+* As pointed out [earlier](#resource-references) in this document, each managed resource can refer to other resources either by their external names, or their object reference. In AWS case, since we are taking a YAML configuration approach, interconnecting resource by api objects makes a lot of sense. At the same time it is still useful to re-use existing external resources. Because of these requirements, we introduce the notion of *reference type* as following:
+
+	```yaml
+	...
+	spec:
+	  ...
+	  someParameter:
+	    # one of {external, apiObject} values
+	    referenceType: apiObject
+      # a string of attributeName.namespacedName format (apiObject case), or arbitrary (external case)
+	    value: attributeNAme.sampleObject.sampleNamespace
+	  ...
+	...
+	```
+	This indicates that the value for `someParameter` will be retrieved from the given attribute, of the given api object. If the `referenceType` was `external`, then the `value` would be interpreted as the actual value of the external resources's requested attribute.
+* One of the issues that rises in this approach, is the dependency that a managed resource might take on another managed resource, when the former uses the latter in its spec. For example, in order to create a `AwsSubnet` instance which consumes a `AwsVpc` instance, the `AwsVpc` instance has to be created and ready. To solve this, we introduce the notion of *resource dependency* in consuming resource's spec:
+	```yaml
+	...
+	metadata:
+	  - namespace: example
+	    name: sample
+	...
+	spec:
+	  ...
+    dependsOn:
+      # a list of strings, each in namespacedName format
+  		- requiredResourceName.requiredResourceNamespace
+	  ...
+	...
+	```
+
+	This indicates that `sample.example` resource needs to wait until all required resources are ready. Moreover, if a resource refers to another resource as an `apiObject` explained above, its dependency is implicit and there is no need to provide the `dependsOn` explicitly in the spec. This is the case in the following resource configurations.
+
+Putting all these together, the high fidelity of these managed resources can be modeled as following. 
+```yaml
+---
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsVpc
+metadata:
+  namespace: crossplane-system
+  name: my-vpc
+spec:
+  region: eu-west-1
+  cidrBlock: 192.168.0.0/16
+---
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsSubnet
+metadata:
+  namespace: crossplane-system
+  name: my-subnet-1
+spec:
+  vpcId:
+    referenceType: apiObject
+    value: id.my-vpc.crossplane-system
+  cidrBlock: 192.168.64.0/18
+  availabilityZone: eu-west-1a
+---
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsSecurityGroup
+metadata:
+  namespace: crossplane-system
+  name: my-eks-sg
+spec:
+  nameFormat: clusterSg
+  vpcId:
+    referenceType: apiObject
+    value: id.my-vpc.crossplane-system
+  description: Cluster communication with worker nodes
+--
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsInternetGateway
+metadata:
+  namespace: crossplane-system
+  name: my-gateway
+spec:
+  vpcId:
+    referenceType: apiObject
+    value: my-vpc.crossplane-system
+--
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsRouteTable
+metadata:
+  namespace: crossplane-system
+  name: my-rt
+spec:
+  vpcId:
+    referenceType: apiObject
+    value: id.my-vpc.crossplane-system
+  route:
+    - cidrBlock: 0.0.0.0/0
+      gateway:
+        referenceType: apiObject
+        value: id.my-gateway.crossplane-system
+--
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsRouteTableAssociation
+metadata:
+  namespace: crossplane-system
+  name: my-rt-association
+spec:
+  subnetId:
+    referenceType: apiObject
+    value: id.my-subnet-1.crossplane-system
+  routeTableId:
+    referenceType: apiObject
+    value: id.my-rt.crossplane-system
+--
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsIamRole
+metadata:
+  namespace: crossplane-system
+  name: my-cluster-role
+spec:
+  nameFormat: clusterRole
+  assumeRolePolicy: |
+	 { 
+	  "Version": "2012-10-17",
+	  "Statement": [
+	    {
+	      "Effect": "Allow",
+	      "Principal": {
+	        "Service": "eks.amazonaws.com"
+	      },
+	      "Action": "sts:AssumeRole"
+	    }
+	  ]
+	 }
+--
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsIamRolePolicyAttachment
+metadata:
+  namespace: crossplane-system
+  name: my-cluster-role-policy-attachment-1
+spec:
+  policy_arn: arn:aws:iam::aws:policy/EKSClusterPolicy
+  role:
+    referenceType: apiObject
+    value: name.my-cluster-role.crossplane-system
+--
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsIamRolePolicyAttachment
+metadata:
+  namespace: crossplane-system
+  name: my-cluster-role-policy-attachment-2
+spec:
+  policy_arn: arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+  role:
+    referenceType: apiObject
+    value: name.my-cluster-role.crossplane-system
+
+### RDS connectivity related managed resources
+--
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsDbSubnetGroup
+metadata:
+  namespace: crossplane-system
+  name: my-db-subnet-group
+spec:
+  nameFormat: subnetGroup
+  subnetIds:
+    - referenceType: apiObject
+      value: id.my-subnet-1.crossplane-system
+--
+apiVersion: network.aws.crossplane.io/v1alpha1
+kind: AwsSecurityGroup
+metadata:
+  namespace: crossplane-system
+  name: my-rds-sg
+spec:
+  nameFormat: rdsSg
+  vpcId:
+    referenceType: apiObject
+    value: id.my-vpc.crossplane-system
+  description: Cluster communication with worker nodes
+  ingress:
+    - fromPort: 3306
+      toPort: 3306
+      protocol: tcp
+      cidrBlocks:
+        - 0.0.0.0/0
+```
+
+Once all these connectivity managed resources are created, the resource classes for `EKSCluster` and `RDSInstance` can be configured as following:
+
+```yaml
+---
+apiVersion: core.crossplane.io/v1alpha1
+kind: ResourceClass
+metadata:
+  name: standard-mysql
+  namespace: crossplane-system
+parameters:
+  class: db.t2.small
+  masterUsername: masteruser
+  securityGroups:
+    - referenceType: apiObject
+      value: id.my-rds-sg.crossplane-system
+  subnetGroupName:
+    referenceType: apiObject
+    value: name.my-db-subnet-group.crossplane-system
+  size: "20"
+provisioner: rdsinstance.database.aws.crossplane.io/v1alpha1
+providerRef:
+  name: aws-provider
+  namespace: crossplane-system
+reclaimPolicy: Delete
+---
+apiVersion: core.crossplane.io/v1alpha1
+kind: ResourceClass
+metadata:
+  name: standard-cluster
+  namespace: crossplane-system
+parameters:
+  region: eu-west-1
+  roleARN:
+    referenceType: apiObject
+    value: arn.my-cluster-role.crossplane-system
+  vpcId:
+    referenceType: apiObject
+    value: id.my-vpc.crossplane-system
+  subnetIds:
+    - referenceType: apiObject
+      value: id.my-subnet-1.crossplane-system
+  securityGroupIds:
+    - referenceType: apiObject
+      value: id.my-eks-sg.crossplane-system
+  workerNodeInstanceType: m3.medium
+  workerNodeAutoScalingGroupMinSize: "1"
+  workerNodeAutoScalingGroupMaxSize: "1"
+  workerNodeGroupName: demo-nodes
+  workerClusterControlPlaneSecurityGroup:
+    - referenceType: apiObject
+      value: id.my-eks-sg.crossplane-system
+provisioner: ekscluster.compute.aws.crossplane.io/v1alpha1
+providerRef:
+  name: aws-provider
+  namespace: crossplane-system
+reclaimPolicy: Delete
+---
+
+```
 
 ### Microsoft Azure
 
@@ -651,3 +923,4 @@ TBD.
 [CloudSQL external resource]: https://cloud.google.com/sql/docs/postgres/admin-api/v1beta4/instances#resource
 [GKE cluster external resource]: https://cloud.google.com/kubernetes-engine/docs/reference/rest/v1/projects.locations.clusters#Cluster
 [Kubernetes API conventions]: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md
+[launch configurations]: [https://docs.aws.amazon.com/autoscaling/ec2/userguide/LaunchConfiguration.html](https://docs.aws.amazon.com/autoscaling/ec2/userguide/LaunchConfiguration.html)
